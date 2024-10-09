@@ -1,0 +1,472 @@
+So there's this nuxt 3 module called `nuxt-rate-limit` it works for on a node server, but I am using a new server offering from official nuxt team called nuxthub.
+
+The module `nuxt-rate-limit` uses an in memory store to keep track of the rate limiting, but nuxthub works on serverless environment, which means the in memory store is not available. They have a neat built in KV store called hubKV(). I want to use that to store rate limiting information.
+
+I will share the entire `nuxt-rate-limit` code here, I want you to make use of the `hubKV()` to store rate limiting in my new module I am making called `nuxthub-ratelimit`.
+
+
+The docs 
+```
+# Nuxt Rate Limit
+
+Add rate limits to your Nuxt 3 API routes.
+
+By default, this module will add a rate limit to any requests to a `/api` endpoint.
+
+- [🏀 Online playground](https://stackblitz.com/github/timb-103/nuxt-rate-limit?file=playground%2Fapp.vue)
+
+## Features
+
+- 🛑 Set rate limits per API route
+- 🕒 Returns seconds until reset
+- ⚡ Takes seconds to setup
+- 🧾 Response x-ratelimit headers
+
+## Quick Setup
+
+1. Add `nuxt-rate-limit` dependency to your project
+
+```sh
+pnpm add -D nuxt-rate-limit
+yarn add --dev nuxt-rate-limit
+npm install --save-dev nuxt-rate-limit
+```
+
+2. Add `nuxt-rate-limit` to the `modules` section of `nuxt.config.ts`
+
+```js
+export default defineNuxtConfig({
+  modules: ['nuxt-rate-limit'],
+})
+```
+
+That's it! You can now use Nuxt Rate Limit in your Nuxt app ✨
+
+## Options
+
+| name | type | default | description |
+| --- | --- | --- | --- |
+| `enabled` | `boolean` | `true` | Enabled/disable the rate limit module |
+| `headers` | `boolean` | `true` | Add x-ratelimit headers to response |
+| `statusMessage` | `string` | `Too many requests. Please try again in :value: seconds.` | Customize error message. `:value:` will be replaced by seconds until reset |
+| `routes` | `object` | [`{}`](https://github.com/timb-103/nuxt-rate-limit/edit/master/README.md#default-rate-limit) | [Add rate limits per route](https://github.com/timb-103/nuxt-rate-limit/edit/master/README.md#different-limits-per-route) |
+
+## Default Rate Limit
+
+By default, we add a rate limit to all of your /api routes. You can override this setting by adding `/api/*` to the `nuxtRateLimit` routes in your `nuxt.config.ts`:
+
+```js
+export default defineNuxtConfig({
+  nuxtRateLimit: {
+    routes: {
+      '/api/*': {
+        maxRequests: 100,
+        intervalSeconds: 60,
+      },
+    },
+  },
+})
+```
+## Different limits per route
+
+You can also add limits per route:
+
+```js
+export default defineNuxtConfig({
+  nuxtRateLimit: {
+    routes: {
+      '/api/hello': {
+        maxRequests: 5,
+        intervalSeconds: 10,
+      },
+      '/api/goodbye': {
+        maxRequests: 15,
+        intervalSeconds: 60,
+      },
+    },
+  },
+})
+```
+```
+
+
+nuxt-rate-limit/src/types.ts
+
+```
+export interface RouteRateLimit {
+  maxRequests: number
+  intervalSeconds: number
+  route: string
+}
+
+export interface RouteRateLimitOptions {
+  maxRequests: number
+  intervalSeconds: number
+}
+
+export interface RateLimitRoutes {
+  [route: string]: RouteRateLimitOptions
+}
+
+export interface RateLimit {
+  [ip: string]: {
+    [route: string]: {
+      firstRequestTime: number
+      requests: number
+    }
+  }
+}
+```
+
+src/module.ts
+```
+import { defineNuxtModule, createResolver, addServerHandler } from '@nuxt/kit'
+import { defu } from 'defu'
+import type { RateLimitRoutes } from './types'
+
+// Module options TypeScript interface definition
+export interface ModuleOptions {
+  enabled: boolean
+  routes: RateLimitRoutes
+  headers: boolean
+  statusMessage?: string
+}
+
+export interface RateLimitOptions {
+  routes: RateLimitRoutes
+}
+
+export default defineNuxtModule<ModuleOptions>({
+  meta: {
+    name: 'nuxt-rate-limit',
+    configKey: 'nuxtRateLimit',
+  },
+  // Default configuration options of the Nuxt module
+  defaults: {
+    enabled: true,
+    headers: true,
+    statusMessage: 'Too many requests. Please try again in :value: seconds.',
+    routes: {
+      '/api/*': {
+        intervalSeconds: 60,
+        maxRequests: 100,
+      },
+    },
+  },
+  async setup(options, nuxt) {
+    const resolver = createResolver(import.meta.url)
+    // opt-out early
+    if (!options.enabled) {
+      return
+    }
+
+    // add options to runtime config
+    nuxt.options.runtimeConfig.nuxtRateLimit = defu(
+      nuxt.options.runtimeConfig.nuxtRateLimit,
+      { headers: options.headers, statusMessage: options.statusMessage }
+    )
+
+    // merge with route rules, so we get free route matching with baseURL support
+    for (const [route, rules] of Object.entries(options.routes)) {
+      nuxt.options.nitro.routeRules = defu(nuxt.options.nitro.routeRules, {
+        [route]: { ['nuxt-rate-limit']: { ...rules, route } },
+      })
+    }
+
+    // add the rate-limit middleware
+    addServerHandler({
+      handler: resolver.resolve('./runtime/server/middleware/rate-limit'),
+    })
+  },
+})
+```
+
+src/runtime/server/utils/rate-limit.ts
+```
+import { H3Event, getRequestHeader } from 'h3'
+import { getRouteRules } from '#imports'
+import type { RateLimit } from '../../../types'
+import { RouteRateLimit } from '../../../types'
+
+interface RateLimitResponse {
+  limited: boolean
+  limit: number
+  current: number
+  secondsUntilReset: number
+}
+
+// store rate limits for each IP address and URL
+const rateLimit: RateLimit = {}
+
+/**
+ * This function checks whether a request from a given IP address and URL should be rate limited
+ *
+ * If rate limited it will return the seconds until they can try again.
+ *
+ * @param event
+ */
+export function getRateLimitPayload(event: H3Event): false | RateLimitResponse {
+  const routeRules = getRouteRules(event)
+  if (!routeRules['nuxt-rate-limit']) {
+    return false
+  }
+
+  const { maxRequests, intervalSeconds, route }: RouteRateLimit = routeRules['nuxt-rate-limit']
+  const intervalMs = intervalSeconds * 1000
+  const ip = getIP(event)
+
+  // remove any IPs & URLs that haven't been used since interval to keep object small
+  const currentTime = Date.now()
+  Object.keys(rateLimit).forEach((key: keyof RateLimit) => {
+    Object.keys(rateLimit[key]).forEach((urlKey: string) => {
+      const item = rateLimit[key][urlKey]
+      const timeSinceLastRequest = currentTime - item.firstRequestTime
+      const routeInterval = intervalSeconds * 1000
+
+      // remove the url
+      if (timeSinceLastRequest >= routeInterval) {
+        delete rateLimit[key][urlKey]
+      }
+    })
+
+    // remove the ip
+    if (!Object.keys(rateLimit[key]).length) {
+      delete rateLimit[key]
+    }
+  })
+
+  // add a rate limit object, or set to existing
+  rateLimit[ip] = rateLimit[ip] || {}
+  // we index the rate limiting based on the route rule route, this allows us to rate limit a wild card entry using the same
+  // rate limit object, eg: /api/* will use the same rate limit object for /api/foo and /api/bar
+  rateLimit[ip][route] = rateLimit[ip][route] || {
+    firstRequestTime: Number(new Date()),
+    requests: 0,
+  }
+
+  const timeSinceFirstRequest = currentTime - rateLimit[ip][route].firstRequestTime
+  const secondsUntilReset = Math.ceil((intervalMs - timeSinceFirstRequest) / 1000)
+  const limited = rateLimit[ip][route].requests >= maxRequests
+  // increment the requests counter
+  if (!limited) {
+    rateLimit[ip][route].requests++
+  }
+
+  return { limited, limit: maxRequests, current: rateLimit[ip][route].requests, secondsUntilReset }
+}
+
+/**
+ * Get the IP of the visitor to use as rate limit key
+ *
+ * @param event
+ */
+function getIP(event: H3Event) {
+  const req = event?.node?.req
+  const xForwardedFor = getRequestHeader(event, 'x-forwarded-for')?.split(',')?.pop()?.trim() || ''
+  const remoteAddress = req?.socket?.remoteAddress || ''
+  let ip = xForwardedFor || remoteAddress
+
+  if (ip) {
+    ip = ip.split(':')[0]
+  }
+
+  return ip
+}
+```
+
+src/runtime/server/middleware/rate-limit.ts
+```
+import { defineEventHandler, createError, setHeader } from 'h3'
+import { getRateLimitPayload} from '../utils/rate-limit'
+import { useRuntimeConfig } from '#imports'
+
+/**
+ * Function that checks a user rate limit.
+ *
+ * Only works on API routes, eg: /api/hello
+ */
+export default defineEventHandler(async (event) => {
+  const { headers, statusMessage } = useRuntimeConfig().nuxtRateLimit
+
+  const payload = getRateLimitPayload(event)
+  // route does not have rate limiting configured
+  if (!payload) {
+    return
+  }
+  const { limited, current, limit, secondsUntilReset } = payload
+
+  if (headers) {
+    setHeader(event, 'x-ratelimit-current', current)
+    setHeader(event, 'x-ratelimit-limit', limit)
+    setHeader(event, 'x-ratelimit-reset', secondsUntilReset)
+  }
+
+  if (limited) {
+    throw createError({
+      statusCode: 429,
+      statusMessage: statusMessage.replace(':value:', String(secondsUntilReset))
+    })
+  }
+})
+```
+
+These are the hubKV() docs below 
+---
+---
+title: Key Value Storage
+navigation.title: Key Value
+description: Add a global, low-latency key-value data storage to your Nuxt application.
+---
+
+## Getting Started
+
+Enable the key-value storage in your NuxtHub project by adding the `kv` property to the `hub` object in your `nuxt.config.ts` file.
+
+```ts [nuxt.config.ts]
+export default defineNuxtConfig({
+  hub: {
+    kv: true
+  }
+})
+```
+
+::note
+This option will use Cloudflare platform proxy in development and automatically create a [Cloudflare Workers KV](https://developers.cloudflare.com/kv) namespace for your project when you [deploy it](/docs/getting-started/deploy).
+::
+
+::tabs
+::div{label="Nuxt DevTools"}
+:nuxt-img{src="/images/landing/nuxt-devtools-kv.png" alt="Nuxt DevTools KV" width="915" height="515" data-zoom-src="/images/landing/nuxt-devtools-kv.png"}
+::
+::div{label="NuxtHub Admin"}
+:nuxt-img{src="/images/landing/nuxthub-admin-kv.png" alt="NuxtHub Admin KV" width="915" height="515" data-zoom-src="/images/landing/nuxthub-admin-kv.png"}
+::
+::
+
+## List all keys
+
+Retrieves all keys from the KV storage.
+
+```ts
+const keys = await hubKV().keys()
+/*
+[
+  'react',
+  'react:gatsby',
+  'react:next',
+  'vue',
+  'vue:nuxt',
+  'vue:quasar'
+]
+```
+
+To get the keys starting with a specific prefix, you can pass the prefix as an argument.
+
+```ts
+const vueKeys = await hubKV().keys('vue')
+/*
+[
+  'vue:nuxt',
+  'vue:quasar'
+]
+*/
+```
+
+::important
+We recommend to use prefixes for better organization and performance as `keys()` will scan the entire namespace.
+::
+
+## Get an item
+
+Retrieves an item from the Key-Value storage.
+
+```ts
+const vue = await hubKV().get('vue')
+/*
+{
+  year: 2014
+}
+*/
+```
+
+## Set an item
+
+Puts an item in the storage.
+
+```ts
+await hubKV().set('vue', { year: 2014 })
+```
+
+You can delimit the key with a `:` to create a namespace:
+
+```ts
+await hubKV().set('vue:nuxt', { year: 2016 })
+```
+
+::note
+The maximum size of a value is 25 MiB and the maximum length of a key is 512 bytes.
+::
+
+### Expiration
+
+You can also set a TTL (time to live) in seconds:
+
+```ts
+await hubKV().set('vue:nuxt', { year: 2016 }, { ttl: 60 })
+```
+
+The item will be deleted after the TTL has expired.
+
+<!--
+If you prefer to specify the expiration date, you can use the `expiration` option:
+
+```ts
+const timestampIn2024 = new Date('2042-01-01').getTime() / 1000
+await hubKV().set('vue:nuxt', { year: 2016 }, { expiration: timestampIn2024 })
+```
+
+### Metadata
+
+You can also set metadata on the item.
+
+```ts
+await hubKV().set('vue', { year: 2024 }, {
+  metadata: {
+    author: 'Evan You'
+  }
+})
+```
+-->
+
+## Has an item
+
+Checks if an item exists in the storage.
+
+```ts
+const hasAngular = await hubKV().has('angular')
+```
+
+## Delete an item
+
+Delete an item from the storage.
+
+```ts
+await hubKV().del('react')
+```
+
+## Limits
+
+- The maximum size of a value is 25 MiB.
+- The maximum length of a key is 512 bytes.
+- The TTL must be at least 60 seconds.
+<!-- - The maximum size of the metadata is 1024 bytes. -->
+
+Learn more about [Cloudflare KV limits](https://developers.cloudflare.com/kv/platform/limits/).
+
+## Learn More
+
+`hubKV()` is an instance of [unstorage](https://unstorage.unjs.io/guide#interface) with the [Cloudflare KV binding](https://unstorage.unjs.io/drivers/cloudflare#cloudflare-kv-binding) driver.
+---
+
+
+I've created a blank module called `nuxthub-ratelimit`, please start.

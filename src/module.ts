@@ -1,5 +1,5 @@
 import { defineNuxtModule, createResolver, addServerHandler } from '@nuxt/kit'
-import { defu } from 'defu'
+import defu from 'defu'
 import type { RateLimitRoutes } from './types'
 
 export interface ModuleOptions {

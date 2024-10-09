@@ -24,6 +24,9 @@ export async function getRateLimitPayload(event: H3Event): Promise<false | RateL
   // Create a key for the KV store using IP and route
   const kvKey = `ratelimit:${ip}:${route}`
 
+  // Ensure TTL is at least 60 seconds - https://hub.nuxt.com/docs/features/kv#limits
+  const ttl = Math.max(intervalSeconds, 60)
+
   // Get existing rate limit data from KV store
   const rateLimitData = await hubKV().get<RateLimitData>(kvKey)
 
@@ -34,8 +37,8 @@ export async function getRateLimitPayload(event: H3Event): Promise<false | RateL
       requests: 1,
     }
 
-    // Store with TTL equal to interval
-    await hubKV().set(kvKey, newData, { ttl: intervalSeconds })
+    // Store with TTL equal to interval, but at least 60 seconds
+    await hubKV().set(kvKey, newData, { ttl })
 
     return {
       limited: false,
@@ -54,7 +57,7 @@ export async function getRateLimitPayload(event: H3Event): Promise<false | RateL
       firstRequestTime: currentTime,
       requests: 1,
     }
-    await hubKV().set(kvKey, newData, { ttl: intervalSeconds })
+    await hubKV().set(kvKey, newData, { ttl })
 
     return {
       limited: false,
@@ -72,7 +75,7 @@ export async function getRateLimitPayload(event: H3Event): Promise<false | RateL
       ...rateLimitData,
       requests: rateLimitData.requests + 1,
     }
-    await hubKV().set(kvKey, newData, { ttl: secondsUntilReset })
+    await hubKV().set(kvKey, newData, { ttl: Math.max(secondsUntilReset, 60) })
   }
 
   return {
